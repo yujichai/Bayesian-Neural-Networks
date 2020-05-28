@@ -1,5 +1,5 @@
 from src.base_net import *
-from optimizers import *
+from src.Stochastic_Gradient_Langevin_Dynamics.optimizers import *
 import torch.nn as nn
 import torch.nn.functional as F
 import copy
@@ -14,7 +14,11 @@ class Linear_2L(nn.Module):
         self.input_dim = input_dim
         self.output_dim = output_dim
 
-        self.fc1 = nn.Linear(input_dim, self.n_hid)
+        self.conv1 = nn.Conv2d(3, 6, 5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(6, 16, 5)
+
+        self.fc1 = nn.Linear(16 * 5 * 5, self.n_hid)
         self.fc2 = nn.Linear(self.n_hid, self.n_hid)
         self.fc3 = nn.Linear(self.n_hid, output_dim)
 
@@ -26,7 +30,10 @@ class Linear_2L(nn.Module):
         # self.act = nn.SELU(inplace=True)
 
     def forward(self, x):
-        x = x.view(-1, self.input_dim)  # view(batch_size, input_dim)
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+
+        x = x.view(-1, 16 * 5 * 5)#x.view(-1, self.input_dim)  # view(batch_size, input_dim)
         # -----------------
         x = self.fc1(x)
         # -----------------

@@ -4,27 +4,25 @@ import torch.utils.data
 from torchvision import transforms, datasets
 import argparse
 import matplotlib
-from src.KF_Laplace.model import *
-from src.KF_Laplace.hessian_operations import chol_scale_invert_kron_factor
+from src.Stochastic_Gradient_Langevin_Dynamics.model_cifar10 import *
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 
-parser = argparse.ArgumentParser(description='Train Bayesian Neural Net on MNIST with MC Dropout Variational Inference')
-
-parser.add_argument('--weight_decay', type=float, nargs='?', action='store', default=0.01,
-                    help='Specify the precision of an isotropic Gaussian prior. Default: 0.01')
-parser.add_argument('--hessian_diag_sig', type=float, nargs='?', action='store', default=0.15,
-                    help='Specify Gaussian prior std for a diagonal term that is added to the approximate hessian. Default: 0.15.')
-parser.add_argument('--epochs', type=int, nargs='?', action='store', default=10,
-                    help='How many epochs to train. Default: 10.')
+parser = argparse.ArgumentParser(description='Train Bayesian Neural Net on MNIST with Stochastic Gradient Langevin Dynamics')
+parser.add_argument('--use_preconditioning', type=bool, nargs='?', action='store', default=True,
+                    help='Use RMSprop preconditioning. Default: True.')
+parser.add_argument('--prior_sig', type=float, nargs='?', action='store', default=0.1,
+                    help='Standard deviation of prior. Default: 0.1.')
+parser.add_argument('--epochs', type=int, nargs='?', action='store', default=200,
+                    help='How many epochs to train. Default: 200.')
 parser.add_argument('--lr', type=float, nargs='?', action='store', default=1e-3,
-                    help='learning rate. Default: 1e-3.')
-parser.add_argument('--models_dir', type=str, nargs='?', action='store', default='KFLaplace_models',
-                    help='Where to save learnt weights, train vectors and Hessian params. Default: \'KFLaplace_models\'.')
-parser.add_argument('--results_dir', type=str, nargs='?', action='store', default='KFLaplace_results',
-                    help='Where to save learnt training plots. Default: \'KFLaplace_results\'.')
+                    help='learning rate. I recommend 1e-3 if preconditioning, else 1e-4. Default: 1e-3.')
+parser.add_argument('--models_dir', type=str, nargs='?', action='store', default='SGLD_models',
+                    help='Where to save learnt weights and train vectors. Default: \'SGLD_models\'.')
+parser.add_argument('--results_dir', type=str, nargs='?', action='store', default='SGLD_results',
+                    help='Where to save learnt training plots. Default: \'SGLD_results\'.')
 args = parser.parse_args()
 
 
@@ -38,7 +36,7 @@ mkdir(models_dir)
 mkdir(results_dir)
 # ------------------------------------------------------------------------------------------------------
 # train config
-NTrainPointsMNIST = 60000
+NTrainPointsCIFAR10 = 50000
 batch_size = 128
 nb_epochs = args.epochs
 log_interval = 1
@@ -50,21 +48,14 @@ cprint('c', '\nData:')
 
 # load data
 
-# data augmentation
-transform_train = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(mean=(0.1307,), std=(0.3081,))
-])
-
-transform_test = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(mean=(0.1307,), std=(0.3081,))
-])
+#We are using 'transform' below, instead of 'transform_train' and 'transform_test', for CIFAR10
+transform = transforms.Compose([transforms.ToTensor(), \
+     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
 use_cuda = torch.cuda.is_available()
 
-trainset = datasets.MNIST(root='../data', train=True, download=True, transform=transform_train)
-valset = datasets.MNIST(root='../data', train=False, download=True, transform=transform_test)
+trainset = datasets.CIFAR10(root='../data', train=True, download=True, transform=transform)
+valset = datasets.CIFAR10(root='../data', train=False, download=True, transform=transform)
 
 if use_cuda:
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, pin_memory=True,
@@ -83,19 +74,28 @@ else:
 cprint('c', '\nNetwork:')
 
 lr = args.lr
-prior_sig = np.sqrt(1/args.weight_decay)
 ########################################################################################
 
-
-
-net = KBayes_Net(lr=lr, channels_in=1, side_in=28, cuda=use_cuda, classes=10, n_hid=1200, batch_size=batch_size, prior_sig=prior_sig)
+if args.use_preconditioning:
+    net = Net_langevin(lr=lr, channels_in=3, side_in=32, cuda=use_cuda, classes=10,
+                       prior_sig=args.prior_sig, N_train=NTrainPointsCIFAR10, nhid=1200, use_p=True)
+else:
+    net = Net_langevin(lr=lr, channels_in=3, side_in=32, cuda=use_cuda, classes=10,
+                       prior_sig=args.prior_sig, N_train=NTrainPointsCIFAR10, nhid=1200, use_p=False)
 
 ## ---------------------------------------------------------------------------------------------------------------------
 # train
 epoch = 0
 cprint('c', '\nTrain:')
 
+## weight saving parameters #######
+start_save = 15
+save_every = 2  # We sample every 2 epochs as I have found samples to be correlated after only 1
+N_saves = 100  # Max number of saves
+###################################
+
 print('  init cost variables:')
+kl_cost_train = np.zeros(nb_epochs)
 pred_cost_train = np.zeros(nb_epochs)
 err_train = np.zeros(nb_epochs)
 
@@ -128,6 +128,9 @@ for i in range(epoch, nb_epochs):
     print("it %d/%d, Jtr_pred = %f, err = %f, " % (i, nb_epochs, pred_cost_train[i], err_train[i]), end="")
     cprint('r', '   time: %f seconds\n' % (toc - tic))
 
+    # ---- save weights
+    if i >= start_save and i % save_every == 0:
+        net.save_sampled_net(max_samples=N_saves)
 
     # ---- dev
     if i % nb_its_dev == 0:
@@ -154,7 +157,8 @@ toc0 = time.time()
 runtime_per_it = (toc0 - tic0) / float(nb_epochs)
 cprint('r', '   average time: %f seconds\n' % runtime_per_it)
 
-net.save(models_dir+'/theta_last.dat')
+# Save weight samples from the posterior
+save_object(net.weight_set_samples, models_dir+'/state_dicts.pkl')
 
 ## ---------------------------------------------------------------------------------------------------------------------
 # results
@@ -174,35 +178,6 @@ np.save(results_dir + '/cost_train.npy', pred_cost_train)
 np.save(results_dir + '/cost_dev.npy', cost_dev)
 np.save(results_dir + '/err_train.npy', err_train)
 np.save(results_dir + '/err_dev.npy', err_dev)
-
-## Time to do Laplace Approximation.
-print('MAP configuration reached: Calculating block diagonal Hessian.')
-
-# Get hessian factors
-EQ1, EHH1, MAP1, EQ2, EHH2, MAP2, EQ3, EHH3, MAP3 = net.get_K_laplace_params(trainloader)
-
-h_params = [EQ1, EHH1, MAP1, EQ2, EHH2, MAP2, EQ3, EHH3, MAP3]
-save_object(h_params, models_dir+'/block_hessian_params.pkl')
-print('Hessian Parameters Saved')
-
-data_scale = np.sqrt(len(trainset))
-prior_sig = args.hessian_diag_sig
-prior_prec = 1/prior_sig**2
-prior_scale = np.sqrt(prior_prec)
-
-# Scale and invert factors
-# upper_Qinv, lower_HHinv
-print('Scaling and inverting Hessian factors')
-scale_inv_EQ1 = chol_scale_invert_kron_factor(EQ1, prior_scale, data_scale, upper=True)
-scale_inv_EHH1 = chol_scale_invert_kron_factor(EHH1, prior_scale, data_scale, upper=False)
-
-scale_inv_EQ2 = chol_scale_invert_kron_factor(EQ2, prior_scale, data_scale, upper=True)
-scale_inv_EHH2 = chol_scale_invert_kron_factor(EHH2, prior_scale, data_scale, upper=False)
-
-scale_inv_EQ3 = chol_scale_invert_kron_factor(EQ3, prior_scale, data_scale, upper=True)
-scale_inv_EHH3 = chol_scale_invert_kron_factor(EHH3, prior_scale, data_scale, upper=False)
-
-
 
 ## ---------------------------------------------------------------------------------------------------------------------
 # fig cost vs its
